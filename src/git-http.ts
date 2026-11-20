@@ -16,6 +16,7 @@ import {
   ZERO_OID,
   type GitObject,
 } from './git-objects.ts';
+import { requestUrl } from './util.ts';
 
 export interface GitRepoLike {
   refs: Map<string, string>;
@@ -36,8 +37,13 @@ const PKT_MAX = 65520;
 function pktLine(data: string | Buffer): Buffer {
   const payload = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
   if (payload.length + 4 > PKT_MAX) throw new Error('pkt-line too large');
-  const head = Buffer.from(payload.length + 4 < 0x10000 ? (payload.length + 4).toString(16).padStart(4, '0') : '', 'ascii');
-  return Buffer.concat([head, payload]);
+  // One allocation: header + payload in a single buffer (the old version
+  // built a header Buffer and a concat per line; pkt-lines are built
+  // hundreds of times per bench round).
+  const out = Buffer.allocUnsafe(payload.length + 4);
+  out.write((payload.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  payload.copy(out, 4);
+  return out;
 }
 const FLUSH = Buffer.from('0000', 'ascii');
 const DELIM = Buffer.from('0001', 'ascii');
@@ -94,9 +100,22 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    let first: Buffer | null = null;
+    let rest: Buffer[] | null = null;
+    req.on('data', (c: Buffer) => {
+      const buf = Buffer.isBuffer(c) ? c : Buffer.from(c);
+      if (first === null) first = buf;
+      else {
+        if (rest === null) rest = [first];
+        rest.push(buf);
+      }
+    });
+    req.on('end', () => {
+      // Single-chunk bodies (every bench POST) skip the concat entirely.
+      if (first === null) resolve(Buffer.alloc(0));
+      else if (rest === null) resolve(first);
+      else resolve(Buffer.concat(rest));
+    });
     req.on('error', reject);
   });
 }
@@ -175,17 +194,6 @@ function advertiseV0(service: 'git-upload-pack' | 'git-receive-pack', repo: GitR
   }
   parts.push(FLUSH);
   return Buffer.concat(parts);
-}
-
-function advertiseV2(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow filter\n'),
-    pktLine('object-format=sha1\n'),
-    FLUSH,
-  ]);
 }
 
 // ---------------------------------------------------------------- fetch planning
@@ -357,11 +365,73 @@ function handleInfoRefs(
     return;
   }
   const v2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '') === 'version=2';
-  const body = v2 ? advertiseV2() : advertiseV0(service, repo);
+  if (v2) {
+    sendBuffer(res, 200, `application/x-${service}-advertisement`, ADVERTISE_V2);
+    return;
+  }
+  const key = `${service}|${refsKey(repo)}`;
+  const cached = adCacheGet(repo, key);
+  if (cached !== undefined) {
+    sendBuffer(res, 200, `application/x-${service}-advertisement`, cached);
+    return;
+  }
+  const body = advertiseV0(service, repo);
+  adCacheSet(repo, key, body);
   sendBuffer(res, 200, `application/x-${service}-advertisement`, body);
 }
 
+// The v2 advertisement never changes (it carries no refs): one shared
+// buffer instead of a fresh concat per info/refs call.
+const ADVERTISE_V2: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow filter\n'),
+  pktLine('object-format=sha1\n'),
+  FLUSH,
+]);
+
+// Cache of v0 advertisements and ls-refs answers, keyed by the ref set
+// they describe. The bench asks info/refs before every push/clone and
+// ls-refs before every clone; the answers only change when the refs change,
+// so a ref-set key makes repeat calls nearly free. Bounded per repo.
+const AD_CACHE_MAX = 8;
+const adCache = new WeakMap<GitRepoLike, Map<string, Buffer>>();
+
+function refsKey(repo: GitRepoLike): string {
+  const names = [...repo.refs.keys()].sort();
+  let key = '';
+  for (const n of names) key += `${n}=${repo.refs.get(n)};`;
+  return key;
+}
+
+function adCacheGet(repo: GitRepoLike, key: string): Buffer | undefined {
+  return adCache.get(repo)?.get(key);
+}
+
+function adCacheSet(repo: GitRepoLike, key: string, value: Buffer): void {
+  let m = adCache.get(repo);
+  if (!m) {
+    m = new Map();
+    adCache.set(repo, m);
+  }
+  if (m.size >= AD_CACHE_MAX) {
+    const first = m.keys().next().value;
+    if (first !== undefined) m.delete(first);
+  }
+  m.set(key, value);
+}
+
 function handleLsRefs(repo: GitRepoLike, args: string[]): Buffer {
+  const key = `ls-refs|${refsKey(repo)}|${args.join('\n')}`;
+  const cached = adCacheGet(repo, key);
+  if (cached !== undefined) return cached;
+  const out = buildLsRefs(repo, args);
+  adCacheSet(repo, key, out);
+  return out;
+}
+
+function buildLsRefs(repo: GitRepoLike, args: string[]): Buffer {
   let peel = true;
   let symrefs = true;
   let unborn = true;
@@ -435,15 +505,8 @@ function handleFetchV2(repo: GitRepoLike, args: string[]): Buffer {
     // thin-pack / ofs-delta / no-progress / filter / deepen-since / deepen-not /
     // done / agent / object-format: accepted, no behaviour change (whole objects).
   }
-  const cacheKey = JSON.stringify([
-    [...wants].sort(),
-    [...haves].sort(),
-    [...shallowSet].sort(),
-    deepen,
-    // Filter lines do not change the pack, but a `filter` request may expect
-    // a filtered pack; include it so filtered and unfiltered never collide.
-    args.filter((a) => a.startsWith('filter ')).sort(),
-  ]);
+  const cacheKey =
+    `${[...wants].sort().join(',')}\n${[...haves].sort().join(',')}\n${[...shallowSet].sort().join(',')}\n${deepen ?? ''}\n${args.filter((a) => a.startsWith('filter ')).sort().join(',')}`;
   const cached = fetchCacheGet(repo, cacheKey);
   if (cached) return cached;
   const plan = planFetch(repo.objects, wants, haves, shallowSet, deepen);
@@ -694,7 +757,7 @@ export function handleGit(
 ): boolean {
   let pathname: string;
   try {
-    pathname = new URL(req.url ?? '/', 'http://entry').pathname;
+    pathname = requestUrl(req).pathname;
   } catch {
     return false;
   }
@@ -727,7 +790,7 @@ export function handleGit(
   void (async () => {
     try {
       if (method === 'GET' && action === 'info/refs') {
-        const service = new URL(req.url ?? '/', 'http://entry').searchParams.get('service') ?? '';
+        const service = requestUrl(req).searchParams.get('service') ?? '';
         handleInfoRefs(req, res, repo, service);
       } else if (method === 'POST' && action === 'git-upload-pack') {
         await handleUploadPack(req, res, repo);

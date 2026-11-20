@@ -22,6 +22,7 @@
 // GraphQL-level errors: HTTP 200 + errors[{message}] naming the bad field.
 
 import { applyFileChange, listFilesAt } from './git-objects.ts';
+import { invalidateIssue } from './rest.ts';
 import type { Comment, Issue, Label, Pull, PullFile, Repo, Store, User } from './store.ts';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
@@ -956,6 +957,7 @@ const FIELD_DEFS: Record<string, Record<string, FieldDef>> = {
         if (!hit) throw new Error(`issue not found for id ${String(input.issueId ?? '')}`);
         hit.issue.state = 'closed';
         hit.issue.updated_at = nowIso(ctx.store);
+        invalidateIssue(hit.issue);
         return { __typename: 'CloseIssuePayload', __issue: hit.issue, __repo: hit.repo };
       },
     },
@@ -1043,6 +1045,7 @@ const FIELD_DEFS: Record<string, Record<string, FieldDef>> = {
         };
         comment.node_id = gid(ctx.store, 'IssueComment', `${hit.repo.id}:${hit.issue.number}:${comment.id}`);
         hit.issue.comments.push(comment);
+        invalidateIssue(hit.issue);
         return { __typename: 'AddCommentPayload', __comment: comment, __issue: hit.issue, __repo: hit.repo };
       },
     },

@@ -43,6 +43,20 @@ export function sendNoContent(res: ServerResponse): void {
   res.end();
 }
 
+/**
+ * Answer with a precomputed JSON body Buffer (e.g. a cached issue
+ * response). Same headers as sendJson; the caller owns the bytes, which
+ * must already include sendJson's trailing newline.
+ */
+export function sendCached(res: ServerResponse, status: number, body: Buffer): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': body.length,
+    'x-github-request-id': nextRequestId(),
+  });
+  res.end(body);
+}
+
 /** Shorthand for a `{"message": ...}` JSON error. */
 export function sendError(res: ServerResponse, status: number, message: string): void {
   sendJson(res, status, { message });
@@ -59,16 +73,50 @@ const MAX_BODY_BYTES = 10 * 1024 * 1024;
  * Non-empty body that is not valid JSON -> `{ok:false}` (caller answers 400).
  */
 export async function readJsonBody(req: IncomingMessage): Promise<BodyResult> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buf = chunk as Buffer;
-    size += buf.length;
-    if (size > MAX_BODY_BYTES) return { ok: false };
-    chunks.push(buf);
-  }
-  if (size === 0) return { ok: true, value: undefined };
-  const text = Buffer.concat(chunks).toString('utf8');
+  // Event-based read (the old `for await` form paid the async-iterator
+  // protocol per chunk; every POST in the benches is a single small chunk).
+  // Contract unchanged: empty/whitespace -> undefined, >10 MiB or bad
+  // JSON -> {ok:false}.
+  const text = await new Promise<string | null>((resolve, reject) => {
+    let first: Buffer | null = null;
+    let rest: Buffer[] | null = null;
+    let size = 0;
+    let done = false;
+    const finish = (value: string | null): void => {
+      if (done) return;
+      done = true;
+      req.removeAllListeners('data');
+      req.removeAllListeners('end');
+      req.removeAllListeners('error');
+      resolve(value);
+    };
+    req.on('data', (c: Buffer) => {
+      if (done) return;
+      const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        finish(null);
+        return;
+      }
+      if (first === null) first = chunk;
+      else {
+        if (rest === null) rest = [first];
+        rest.push(chunk);
+      }
+    });
+    req.on('end', () => {
+      if (first === null) finish('');
+      else if (rest === null) finish(first.toString('utf8'));
+      else finish(Buffer.concat(rest).toString('utf8'));
+    });
+    req.on('error', (err) => {
+      if (!done) {
+        done = true;
+        reject(err);
+      }
+    });
+  });
+  if (text === null) return { ok: false };
   if (text.trim() === '') return { ok: true, value: undefined };
   try {
     return { ok: true, value: JSON.parse(text) };
@@ -97,6 +145,27 @@ export function isAuthorized(req: IncomingMessage): boolean {
 export function originOf(req: IncomingMessage): string {
   const host = req.headers.host ?? '127.0.0.1';
   return `http://${host}`;
+}
+
+const PARSED_URL = Symbol('parsedUrl');
+
+/**
+ * The request URL, parsed once per request and cached on it. The router
+ * (app.ts), git and REST each used to parse it separately — three `new URL`
+ * per request on the hot paths.
+ */
+export function requestUrl(req: IncomingMessage): URL {
+  const holder = req as unknown as Record<symbol, URL | undefined>;
+  const cached = holder[PARSED_URL];
+  if (cached !== undefined) return cached;
+  let url: URL;
+  try {
+    url = new URL(req.url ?? '/', 'http://entry');
+  } catch {
+    url = new URL('/', 'http://entry');
+  }
+  holder[PARSED_URL] = url;
+  return url;
 }
 
 export interface PageParams {

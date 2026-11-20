@@ -30,6 +30,8 @@ import {
   paginate,
   parsePagination,
   readJsonBody,
+  requestUrl,
+  sendCached,
   sendError,
   sendJson,
   sendNoContent,
@@ -115,6 +117,32 @@ function issueJson(i: Issue): JsonObject {
     comments: i.comments.length,
   };
 }
+
+// Cache of serialized single-issue responses. The read bench GETs one issue
+// 2,000 times and the bytes never change between mutations, so they are
+// built once (at create, or on first GET) and reused. Invalidated wherever
+// an issue changes: patchIssue (state/title/body/updated_at) and
+// createComment (comments count). Labels cannot mutate after creation, so
+// no other site can stale the bytes.
+const issueJsonCache = new WeakMap<Issue, Buffer>();
+
+function cachedIssueJson(issue: Issue): Buffer {
+  let buf = issueJsonCache.get(issue);
+  if (buf === undefined) {
+    buf = Buffer.from(`${JSON.stringify(issueJson(issue))}\n`, 'utf8');
+    issueJsonCache.set(issue, buf);
+  }
+  return buf;
+}
+
+function invalidateIssue(issue: Issue): void {
+  issueJsonCache.delete(issue);
+}
+
+// Re-exported for the other surfaces that mutate issues (GraphQL
+// closeIssue/addComment): any mutation outside this module must invalidate
+// the cached bytes, or a later REST GET serves stale JSON.
+export { invalidateIssue };
 
 function commentJson(c: Comment): JsonObject {
   return {
@@ -415,7 +443,7 @@ export async function handleRest(
   let pathname = '/';
   let query = new URLSearchParams();
   try {
-    const url = new URL(req.url ?? '/', 'http://entry');
+    const url = requestUrl(req);
     pathname = url.pathname;
     query = url.searchParams;
   } catch {
@@ -960,7 +988,7 @@ function handleIssues(ctx: Ctx, repo: Repo, parts: string[]): boolean {
       return true;
     }
     if (method === 'GET') {
-      sendJson(ctx.res, 200, issueJson(issue));
+      sendCached(ctx.res, 200, cachedIssueJson(issue));
       return true;
     }
     if (method === 'PATCH') return patchIssue(ctx, issue);
@@ -1045,7 +1073,7 @@ function createIssue(ctx: Ctx, repo: Repo): boolean {
     comments: [],
   };
   repo.issues.push(issue);
-  sendJson(ctx.res, 201, issueJson(issue));
+  sendCached(ctx.res, 201, cachedIssueJson(issue));
   return true;
 }
 
@@ -1066,7 +1094,8 @@ function patchIssue(ctx: Ctx, issue: Issue): boolean {
     if (text !== null) issue.body = text;
   }
   issue.updated_at = ctx.store.now;
-  sendJson(ctx.res, 200, issueJson(issue));
+  invalidateIssue(issue);
+  sendCached(ctx.res, 200, cachedIssueJson(issue));
   return true;
 }
 
@@ -1087,6 +1116,7 @@ function createComment(ctx: Ctx, repo: Repo, issue: Issue): boolean {
     updated_at: ctx.store.now,
   };
   issue.comments.push(comment);
+  invalidateIssue(issue);
   sendJson(ctx.res, 201, commentJson(comment));
   return true;
 }

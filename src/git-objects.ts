@@ -255,6 +255,38 @@ export function readPack(buf: Buffer, external?: Map<string, GitObject>): Map<st
   const expect = createHash('sha1').update(buf.subarray(0, buf.length - 20)).digest();
   if (!expect.equals(trailer)) throw new Error('pack-checksum');
 
+  const fast = readPackFast(buf, count);
+  if (fast !== null) return fast;
+  return readPackFull(buf, count, external);
+}
+
+/**
+ * Fast path for delta-free packs (the only kind the bench and the suite
+ * client ever send): one pass, no resolve machinery, no per-entry Maps or
+ * closures. Returns null when any entry is a delta, so the caller falls
+ * back to the full reader. Header and trailer were already verified by
+ * readPack. Error strings match the full reader's for the same input.
+ */
+function readPackFast(buf: Buffer, count: number): Map<string, GitObject> | null {
+  const out = new Map<string, GitObject>();
+  let off = 12;
+  for (let n = 0; n < count; n++) {
+    const { type, size, next } = decodeVarintSize(buf, off);
+    off = next;
+    if (type === 6 || type === 7) return null;
+    const code = CODE_TYPES[type];
+    if (code === undefined) throw new Error(`unknown pack entry type ${type}`);
+    const { data: inflated, next: nextOff } = inflateAt(buf, off);
+    off = nextOff;
+    if (inflated.length !== size) throw new Error('pack entry size mismatch');
+    out.set(objectId(code, inflated), { type: code, data: inflated });
+  }
+  if (off !== buf.length - 20) throw new Error('pack trailing bytes');
+  return out;
+}
+
+/** Full reader: delta resolution (OFS/REF, chains), external bases. */
+function readPackFull(buf: Buffer, count: number, external?: Map<string, GitObject>): Map<string, GitObject> {
   interface RawEntry {
     offset: number;
     typeCode: number;

@@ -8,14 +8,10 @@ import { handleGit } from './src/git-http.ts';
 import { handleRest } from './src/rest.ts';
 import { handleGraphQLRequest } from './src/graphql.ts';
 import { mcpHandler } from './src/mcp.ts';
-import { sendJson } from './src/util.ts';
+import { requestUrl, sendJson } from './src/util.ts';
 
 function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+  return requestUrl(req).pathname;
 }
 
 export function createApp(): Server {
